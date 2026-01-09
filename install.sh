@@ -3,13 +3,13 @@ set -euo pipefail
 
 APP="TorrServer (Alpine LXC)"
 
+# Defaults (используются в режиме Default, и как значения по умолчанию в Advanced)
 DEF_HOSTNAME="torrserver"
-DEF_TEMPLATE_STORAGE="local"     # где лежат LXC templates (vztmpl)
-DEF_ROOTFS_STORAGE="local-lvm"   # storage для rootfs
+DEF_TEMPLATE_STORAGE="local"     # будет только подсказкой, выбор всё равно из списка
+DEF_ROOTFS_STORAGE="local-lvm"   # будет только подсказкой, выбор всё равно из списка
 DEF_ROOTFS_SIZE="1"              # GiB
-DEF_DATA_STORAGE="local-lvm"     # storage для отдельного тома /opt/ts
+DEF_DATA_STORAGE="local-lvm"     # будет только подсказкой, выбор всё равно из списка
 DEF_DATA_SIZE="4"                # GiB
-
 DEF_RAM="256"                    # MiB
 DEF_CORES="1"
 DEF_BRIDGE="vmbr0"
@@ -21,9 +21,11 @@ FALLBACK_TEMPLATE="alpine-3.22-default_20250617_amd64.tar.xz"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1"; exit 1; }; }
 
+have_whiptail() { command -v whiptail >/dev/null 2>&1; }
+
 ask() {
   local title="$1" prompt="$2" def="$3" out
-  if command -v whiptail >/dev/null 2>&1; then
+  if have_whiptail; then
     out=$(whiptail --backtitle "Proxmox VE Helper-Scripts style" --title "$title" \
       --inputbox "$prompt" 9 74 "$def" 3>&1 1>&2 2>&3) || exit 1
     echo "$out"
@@ -31,6 +33,63 @@ ask() {
     read -r -p "$prompt [$def]: " out
     echo "${out:-$def}"
   fi
+}
+
+menu() {
+  # menu "TITLE" "PROMPT" "DEFAULT_TAG" "tag1" "item1" "tag2" "item2" ...
+  local title="$1"; shift
+  local prompt="$1"; shift
+  local def="$1"; shift
+
+  if have_whiptail; then
+    whiptail --backtitle "Proxmox VE Helper-Scripts style" --title "$title" \
+      --menu "$prompt" 18 78 10 --default-item "$def" "$@" 3>&1 1>&2 2>&3
+  else
+    # fallback: простейший select по тегам
+    local tags=()
+    while [ $# -gt 0 ]; do
+      tags+=("$1"); shift
+      shift || true
+    done
+    echo "Select: $prompt"
+    local i=1
+    for t in "${tags[@]}"; do echo "  $i) $t"; i=$((i+1)); done
+    local n
+    read -r -p "Choice [1-${#tags[@]}] (default: 1): " n
+    n="${n:-1}"
+    echo "${tags[$((n-1))]}"
+  fi
+}
+
+get_storages_for_content() {
+  # Prints storage IDs which are active and support given content
+  local content="$1"
+  pvesm status -content "$content" 2>/dev/null \
+    | awk 'NR>1 && $3=="active" {print $1}'
+}
+
+select_storage() {
+  # select_storage "Title" "Prompt" content defaultStorage
+  local title="$1" prompt="$2" content="$3" def="$4"
+
+  mapfile -t storages < <(get_storages_for_content "$content")
+  if [ "${#storages[@]}" -eq 0 ]; then
+    echo "No active storages found with content '$content' (check storage.cfg)." >&2
+    exit 1
+  fi
+
+  # whiptail expects pairs tag/desc
+  local opts=()
+  local found_def=0
+  for s in "${storages[@]}"; do
+    [ "$s" = "$def" ] && found_def=1
+    opts+=("$s" "")
+  done
+
+  local default_item="${storages[0]}"
+  [ "$found_def" -eq 1 ] && default_item="$def"
+
+  menu "$title" "$prompt" "$default_item" "${opts[@]}"
 }
 
 pick_latest_alpine_template() {
@@ -48,6 +107,7 @@ main() {
   need_cmd pct
   need_cmd pveam
   need_cmd pvesh
+  need_cmd pvesm
   need_cmd dpkg
   need_cmd awk
   need_cmd grep
@@ -58,22 +118,41 @@ main() {
   local CTID
   CTID="$(pvesh get /cluster/nextid)"
 
-  # Всегда спрашиваем параметры (Enter = дефолт)
-  local HOSTNAME TEMPLATE_STORAGE ROOTFS_STORAGE ROOTFS_SIZE DATA_STORAGE DATA_SIZE
-  local RAM CORES BRIDGE IPCONF TZ PORT
+  # Выбор режима
+  local MODE
+  MODE="$(menu "MODE" "Installation mode" "default" \
+    "default"  "Default settings" \
+    "advanced" "Advanced settings")"
 
-  HOSTNAME="$(ask "HOSTNAME" "Container hostname" "$DEF_HOSTNAME")"
-  TEMPLATE_STORAGE="$(ask "TEMPLATE STORAGE" "Template storage (usually local)" "$DEF_TEMPLATE_STORAGE")"
-  ROOTFS_STORAGE="$(ask "ROOTFS STORAGE" "RootFS storage (e.g. local-lvm/zfs/dir)" "$DEF_ROOTFS_STORAGE")"
-  ROOTFS_SIZE="$(ask "ROOTFS SIZE" "RootFS size (GiB)" "$DEF_ROOTFS_SIZE")"
-  DATA_STORAGE="$(ask "DATA STORAGE" "Storage for /opt/ts volume" "$DEF_DATA_STORAGE")"
-  DATA_SIZE="$(ask "DATA SIZE" "/opt/ts volume size (GiB)" "$DEF_DATA_SIZE")"
-  RAM="$(ask "RAM" "RAM (MiB)" "$DEF_RAM")"
-  CORES="$(ask "CORES" "CPU cores" "$DEF_CORES")"
-  BRIDGE="$(ask "NETWORK" "Bridge (e.g. vmbr0)" "$DEF_BRIDGE")"
-  IPCONF="$(ask "NETWORK" "IP config (dhcp OR ip/mask,gw=gwip)" "$DEF_IPCONF")"
-  TZ="$(ask "TIMEZONE" "Timezone" "$DEF_TZ")"
-  PORT="$(ask "PORT" "TorrServer port" "$DEF_PORT")"
+  # Storage choices всегда через меню (чтобы не промахнуться)
+  local TEMPLATE_STORAGE ROOTFS_STORAGE DATA_STORAGE
+  TEMPLATE_STORAGE="$(select_storage "TEMPLATE STORAGE" "Select storage for LXC templates (vztmpl)" "vztmpl" "$DEF_TEMPLATE_STORAGE")"
+  ROOTFS_STORAGE="$(select_storage "ROOTFS STORAGE" "Select storage for container rootfs (rootdir)" "rootdir" "$DEF_ROOTFS_STORAGE")"
+  DATA_STORAGE="$(select_storage "DATA STORAGE" "Select storage for /opt/ts volume (rootdir)" "rootdir" "$DEF_DATA_STORAGE")"
+
+  # Параметры
+  local HOSTNAME ROOTFS_SIZE DATA_SIZE RAM CORES BRIDGE IPCONF TZ PORT
+  if [ "$MODE" = "advanced" ]; then
+    HOSTNAME="$(ask "HOSTNAME" "Container hostname" "$DEF_HOSTNAME")"
+    ROOTFS_SIZE="$(ask "ROOTFS SIZE" "RootFS size (GiB)" "$DEF_ROOTFS_SIZE")"
+    DATA_SIZE="$(ask "DATA SIZE" "/opt/ts volume size (GiB)" "$DEF_DATA_SIZE")"
+    RAM="$(ask "RAM" "RAM (MiB)" "$DEF_RAM")"
+    CORES="$(ask "CORES" "CPU cores" "$DEF_CORES")"
+    BRIDGE="$(ask "NETWORK" "Bridge (e.g. vmbr0)" "$DEF_BRIDGE")"
+    IPCONF="$(ask "NETWORK" "IP config (dhcp OR ip/mask,gw=gwip)" "$DEF_IPCONF")"
+    TZ="$(ask "TIMEZONE" "Timezone" "$DEF_TZ")"
+    PORT="$(ask "PORT" "TorrServer port" "$DEF_PORT")"
+  else
+    HOSTNAME="$DEF_HOSTNAME"
+    ROOTFS_SIZE="$DEF_ROOTFS_SIZE"
+    DATA_SIZE="$DEF_DATA_SIZE"
+    RAM="$DEF_RAM"
+    CORES="$DEF_CORES"
+    BRIDGE="$DEF_BRIDGE"
+    IPCONF="$DEF_IPCONF"
+    TZ="$DEF_TZ"
+    PORT="$DEF_PORT"
+  fi
 
   pveam update
 
@@ -93,7 +172,7 @@ main() {
 
   pveam download "$TEMPLATE_STORAGE" "$template" || true
 
-  # Создаём контейнер + отдельный volume под /opt/ts (единая папка для config/cache/log)
+  # Создаём контейнер + отдельный volume под /opt/ts
   pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${template}" \
     --ostype alpine \
     --hostname "$HOSTNAME" \
@@ -105,7 +184,7 @@ main() {
     --mp0 "${DATA_STORAGE}:${DATA_SIZE},mp=/opt/ts" \
     --start 1
 
-  # Provision внутри Alpine (ВАЖНО: heredoc закрывается строго с 0-й колонки)
+  # Provision внутри Alpine (heredoc закрывается строго с 0-й колонки)
   cat > /tmp/provision-torrserver-alpine.sh <<'EOF'
 #!/bin/sh
 set -eu
@@ -123,7 +202,6 @@ fi
 
 # Единый volume /opt/ts
 mkdir -p /opt/ts/config /opt/ts/cache /opt/ts/log
-# совместимость с прежним "torrents"
 ln -snf /opt/ts/cache /opt/ts/torrents
 
 # user/group
@@ -146,7 +224,6 @@ URL="https://github.com/YouROK/TorrServer/releases/latest/download/TorrServer-li
 curl -L -o "${BIN}" "${URL}"
 chmod +x "${BIN}"
 
-# env (аналог compose)
 cat > /etc/conf.d/torrserver <<CONF
 TZ=${TZ}
 TS_PORT=${PORT}
@@ -158,7 +235,6 @@ TS_LOG_PATH=/opt/ts/log/torrserver.log
 # TS_RDB=1
 CONF
 
-# wrapper: env -> args
 cat > /usr/local/bin/torrserver-run <<'RUN'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -183,7 +259,6 @@ exec /usr/local/bin/torrserver "${ARGS[@]}"
 RUN
 chmod +x /usr/local/bin/torrserver-run
 
-# OpenRC service
 cat > /etc/init.d/torrserver <<'INIT'
 #!/sbin/openrc-run
 
@@ -199,9 +274,7 @@ respawn_delay=5
 respawn_max=0
 respawn_period=0
 
-depend() {
-  need net
-}
+depend() { need net; }
 INIT
 chmod +x /etc/init.d/torrserver
 
