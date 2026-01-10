@@ -214,6 +214,22 @@ ssh_keys_select_from_pve() {
   echo "$picked" | awk 'NF>1 && $1 ~ /^ssh-|^ecdsa-|^sk-ssh-/ {print $0}' | awk '!seen[$0]++'
 }
 
+get_ct_ipv4() {
+  local id="$1"
+  # ждём сеть до ~15 секунд
+  for _ in $(seq 1 30); do
+    local ip
+    ip="$(pct exec "$id" -- sh -lc "ip -4 -o addr show scope global | awk '{print \$4}' | cut -d/ -f1 | head -n1" 2>/dev/null || true)"
+    if [ -n "${ip:-}" ]; then
+      echo "$ip"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo ""
+}
+
+
 main() {
   [ "$(id -u)" -eq 0 ] || die "Run as root on Proxmox node."
 
@@ -522,13 +538,17 @@ EOF
   [ -n "${SSH_KEYS_FILE:-}" ] && rm -f "$SSH_KEYS_FILE" || true
   [ -n "${ROOTPW_FILE:-}" ] && rm -f "$ROOTPW_FILE" || true
 
+  local CT_IP
+  CT_IP="$(get_ct_ipv4 "$CTID")"
+
   echo >&2
   ok "Created CTID: $CTID"
   ok "Tags: $TAGS"
-  ok "TorrServer URL: http://<CT_IP>:${PORT}"
-  ok "Service check: pct exec ${CTID} -- rc-service torrserver status"
-  ok "Port check: pct exec ${CTID} -- sh -lc 'apk add --no-cache iproute2-ss >/dev/null 2>&1 || true; ss -ltnp \"( sport = :${PORT} )\" || true'"
-  ok "Logs: pct exec ${CTID} -- tail -n 120 /opt/ts/log/torrserver.stderr.log"
+  if [ -n "${CT_IP:-}" ]; then
+    ok "TorrServer URL: http://${CT_IP}:${PORT}"
+  else
+    ok "TorrServer URL: http://<CT_IP>:${PORT}"
+  fi
 }
 
 main "$@"
