@@ -13,11 +13,11 @@ DEF_CORES="1"
 DEF_BRIDGE="vmbr0"
 DEF_IPCONF="dhcp"
 DEF_TZ="Europe/Moscow"
-DEF_PORT="8090"
+DEF_PORT="80"
 FALLBACK_TEMPLATE="alpine-3.22-default_20250617_amd64.tar.xz"
 
 # ---------- Pretty output (ASCII only) ----------
-CLR="\e[0m"; BL="\e[36m"; GN="\e[32m"; YW="\e[33m"; RD="\e[31m"; BOLD="\e[1m"
+CLR="\e[0m"; BL="\e[36m"; GN="\e[32m"; YW="\e[33m"; RD="\e[31m"
 log()  { echo -e "${BL}==>${CLR} $*" >&2; }
 ok()   { echo -e "${GN}[OK]${CLR} $*" >&2; }
 warn() { echo -e "${YW}[!!]${CLR} $*" >&2; }
@@ -86,6 +86,13 @@ password_prompt_optional() {
   fi
 }
 
+validate_password_for_chpasswd() {
+  local pw="$1"
+  if printf "%s" "$pw" | grep -q $'[\n\r:]'; then
+    die "Password contains forbidden characters (: or newline). Choose another password."
+  fi
+}
+
 pick_latest_alpine_template() {
   local arch="$1"
   pveam available --section system \
@@ -119,7 +126,6 @@ select_storage() {
     used="$(awk '{print $5}' <<<"$r")"
     availp="$(awk '{print $6}' <<<"$r")"
     [ "$status" = "active" ] || continue
-
     [ -z "$first" ] && first="$name"
 
     local free_k=$((total-used))
@@ -207,13 +213,6 @@ ssh_keys_select_from_pve() {
   echo "$picked" | awk 'NF>1 && $1 ~ /^ssh-|^ecdsa-|^sk-ssh-/ {print $0}' | awk '!seen[$0]++'
 }
 
-validate_password_for_chpasswd() {
-  local pw="$1"
-  if printf "%s" "$pw" | grep -q $'[\n\r:]'; then
-    die "Password contains forbidden characters (: or newline). Choose another password."
-  fi
-}
-
 main() {
   [ "$(id -u)" -eq 0 ] || die "Run as root on Proxmox node."
 
@@ -253,7 +252,7 @@ main() {
     BRIDGE="$(ask "NETWORK" "Bridge (e.g. vmbr0)" "$DEF_BRIDGE")"
     IPCONF="$(ask "NETWORK" "IPv4 (dhcp OR ip/mask,gw=gwip)" "$DEF_IPCONF")"
     TZ="$(ask "TIMEZONE" "Timezone" "$DEF_TZ")"
-    PORT="$(ask "PORT" "TorrServer port (can be 80/443 too)" "$DEF_PORT")"
+    PORT="$(ask "PORT" "TorrServer port (80 supported via supervise-daemon capabilities)" "$DEF_PORT")"
     TAGS="$(ask "TAGS" "Container tags (semicolon-separated)" "$DEF_TAGS")"
   else
     HOSTNAME="$DEF_HOSTNAME"
@@ -268,7 +267,6 @@ main() {
     TAGS="$DEF_TAGS"
   fi
 
-  # validate PORT numeric
   case "$PORT" in
     ''|*[!0-9]*) die "PORT must be numeric, got: '$PORT'" ;;
   esac
@@ -331,7 +329,7 @@ main() {
     --start 1
   )
 
-  # Optionally also set via pct. Doc: --password, --ssh-public-keys, --tags supported. [page:0]
+  # pct create supports these options. [page:1]
   [ -n "${ROOT_PW:-}" ] && PCT_ARGS+=( --password "$ROOT_PW" )
   [ -n "${SSH_KEYS_FILE:-}" ] && PCT_ARGS+=( --ssh-public-keys "$SSH_KEYS_FILE" )
 
@@ -345,14 +343,13 @@ main() {
     printf "root:%s\n" "$ROOT_PW" >"$ROOTPW_FILE"
   fi
 
-  # Provision
-  log "Provisioning inside container (includes setcap for privileged ports)..."
+  log "Provisioning inside container..."
   cat > /tmp/provision-torrserver-alpine.sh <<'EOF'
 #!/bin/sh
 set -eu
 
 : "${TZ:=Europe/Moscow}"
-: "${PORT:=8090}"
+: "${PORT:=80}"
 : "${ENABLE_SSH:=0}"      # 1/0
 : "${ROOTPW_FILE:=}"      # optional path with "root:pass"
 : "${SSHKEYS_FILE:=}"     # optional path with public keys (one per line)
@@ -361,7 +358,7 @@ case "${PORT}" in
   ''|*[!0-9]*) echo "Invalid PORT=${PORT}" >&2; exit 1 ;;
 esac
 
-apk add --no-cache ca-certificates curl wget tzdata bash gcompat libc6-compat libcap-setcap
+apk add --no-cache ca-certificates curl wget tzdata bash gcompat libc6-compat openssh ffmpeg
 
 # timezone
 if [ -e "/usr/share/zoneinfo/${TZ}" ]; then
@@ -369,13 +366,13 @@ if [ -e "/usr/share/zoneinfo/${TZ}" ]; then
   echo "${TZ}" > /etc/timezone
 fi
 
-# Apply root password if provided
+# root password
 if [ -n "${ROOTPW_FILE}" ] && [ -f "${ROOTPW_FILE}" ]; then
   chpasswd < "${ROOTPW_FILE}" || true
   passwd -u root 2>/dev/null || true
 fi
 
-# Apply SSH keys if provided
+# ssh keys
 if [ -n "${SSHKEYS_FILE}" ] && [ -f "${SSHKEYS_FILE}" ]; then
   mkdir -p /root/.ssh
   cat "${SSHKEYS_FILE}" >> /root/.ssh/authorized_keys
@@ -383,12 +380,9 @@ if [ -n "${SSHKEYS_FILE}" ] && [ -f "${SSHKEYS_FILE}" ]; then
   chmod 600 /root/.ssh/authorized_keys
 fi
 
-# Enable SSH if requested
+# enable ssh if requested
 if [ "${ENABLE_SSH}" = "1" ]; then
-  apk add --no-cache openssh
   ssh-keygen -A
-
-  # Allow root login: password if set, otherwise keys-only
   if [ -n "${ROOTPW_FILE}" ] && [ -f "${ROOTPW_FILE}" ]; then
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
     sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
@@ -396,18 +390,20 @@ if [ "${ENABLE_SSH}" = "1" ]; then
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || true
     sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config || true
   fi
-
   rc-update add sshd default
   rc-service sshd restart || rc-service sshd start
 fi
 
-# Data layout: one volume /opt/ts
-mkdir -p /opt/ts/config /opt/ts/cache /opt/ts/log
+# /opt/ts volume + home
+mkdir -p /opt/ts/config /opt/ts/cache /opt/ts/log /opt/ts/home
 ln -snf /opt/ts/cache /opt/ts/torrents
 
-# service user + permissions
 addgroup -S torrserver 2>/dev/null || true
-adduser  -S -D -H -s /sbin/nologin -G torrserver torrserver 2>/dev/null || true
+
+# Create user with home at /opt/ts/home (no-login)
+# NOTE: adduser flags differ across distros; in Alpine BusyBox adduser supports -h for home.
+adduser -S -D -H -h /opt/ts/home -s /sbin/nologin -G torrserver torrserver 2>/dev/null || true
+
 chown -R torrserver:torrserver /opt/ts || true
 
 # download TorrServer
@@ -426,14 +422,7 @@ URL="https://github.com/YouROK/TorrServer/releases/latest/download/TorrServer-li
 curl -L -o "${BIN}" "${URL}"
 chmod +x "${BIN}"
 
-# Variant B: if PORT < 1024 allow bind without root
-if [ "${PORT}" -lt 1024 ]; then
-  setcap 'cap_net_bind_service=+ep' "${BIN}" || {
-    echo "setcap failed. Your filesystem may not support xattrs. Use PORT>=1024 or change storage." >&2
-    exit 1
-  }
-fi
-
+# config
 cat > /etc/conf.d/torrserver <<CONF
 TZ=${TZ}
 TS_PORT=${PORT}
@@ -441,9 +430,10 @@ TS_DONTKILL=1
 TS_CONF_PATH=/opt/ts/config
 TS_TORR_DIR=/opt/ts/cache
 TS_LOG_PATH=/opt/ts/log/torrserver.log
+TS_HOME=/opt/ts/home
 CONF
 
-# wrapper with logging
+# wrapper with logging + HOME
 cat > /usr/local/bin/torrserver-run <<'RUN'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -451,10 +441,12 @@ set -a
 [ -f /etc/conf.d/torrserver ] && . /etc/conf.d/torrserver
 set +a
 
+export HOME="${TS_HOME:-/opt/ts/home}"
+
 mkdir -p /opt/ts/log || true
 exec >>/opt/ts/log/torrserver.stdout.log 2>>/opt/ts/log/torrserver.stderr.log
 
-ARGS=( "--port" "${TS_PORT:-8090}"
+ARGS=( "--port" "${TS_PORT:-80}"
        "--path" "${TS_CONF_PATH:-/opt/ts/config}"
        "--torrentsdir" "${TS_TORR_DIR:-/opt/ts/cache}" )
 
@@ -467,12 +459,13 @@ if [ -n "${TS_LOG_PATH:-}" ]; then
   ARGS+=( "--logpath" "${TS_LOG_PATH}" )
 fi
 
-echo "Starting TorrServer at $(date -Iseconds) with args: ${ARGS[*]}" >&2
+echo "Starting TorrServer at $(date -Iseconds) with HOME=${HOME} args: ${ARGS[*]}" >&2
 exec /usr/local/bin/torrserver "${ARGS[@]}"
 RUN
 chmod +x /usr/local/bin/torrserver-run
 
-# OpenRC service
+# OpenRC service: use supervise-daemon with capabilities so bind(80) works in unprivileged LXC
+# supervise-daemon supports --capabilities cap-list. [page:0]
 cat > /etc/init.d/torrserver <<'INIT'
 #!/sbin/openrc-run
 name="torrserver"
@@ -486,6 +479,10 @@ pidfile="/run/${RC_SVCNAME}.pid"
 respawn_delay=5
 respawn_max=0
 respawn_period=0
+
+# CAP_NET_BIND_SERVICE allows binding to ports <1024 (like 80) without running as root.
+# Using supervise-daemon --capabilities is more reliable than filecap in some container setups.
+supervise_daemon_args="--capabilities cap_net_bind_service+eip"
 
 depend() { need net; }
 INIT
@@ -526,9 +523,9 @@ EOF
   ok "Created CTID: $CTID"
   ok "Tags: $TAGS"
   ok "TorrServer URL: http://<CT_IP>:${PORT}"
-  ok "If PORT < 1024: capability set via setcap (cap_net_bind_service)."
   ok "Service check: pct exec ${CTID} -- rc-service torrserver status"
-  ok "Debug: pct exec ${CTID} -- tail -n 200 /opt/ts/log/torrserver.stderr.log"
+  ok "Port check: pct exec ${CTID} -- sh -lc 'apk add --no-cache iproute2-ss >/dev/null 2>&1 || true; ss -ltnp \"( sport = :${PORT} )\" || true'"
+  ok "Logs: pct exec ${CTID} -- tail -n 120 /opt/ts/log/torrserver.stderr.log"
 }
 
 main "$@"
