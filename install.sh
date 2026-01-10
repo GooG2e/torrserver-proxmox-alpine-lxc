@@ -88,7 +88,8 @@ password_prompt_optional() {
 
 validate_password_for_chpasswd() {
   local pw="$1"
-  if printf "%s" "$pw" | grep -q $'[\n\r:]'; then
+  # chpasswd expects "user:pass", forbid ':' and newlines
+  if [[ "$pw" == *:* || "$pw" == *$'\n'* || "$pw" == *$'\r'* ]]; then
     die "Password contains forbidden characters (: or newline). Choose another password."
   fi
 }
@@ -274,7 +275,7 @@ main() {
   log "Auth: you can set BOTH root password and SSH keys."
   local ROOT_PW
   ROOT_PW="$(password_prompt_optional)"
-  if [ -n "${ROOT_PW:-}" ]; then validate_password_for_chpasswd "$ROOT_PW"; fi
+  [ -n "${ROOT_PW:-}" ] && validate_password_for_chpasswd "$ROOT_PW"
 
   local SSH_MODE SSH_KEYS SSH_KEYS_FILE=""
   SSH_MODE="$(ssh_key_mode)"
@@ -329,7 +330,7 @@ main() {
     --start 1
   )
 
-  # pct create supports these options. [page:1]
+  # pct create supports: --password, --ssh-public-keys, --tags [page:1]
   [ -n "${ROOT_PW:-}" ] && PCT_ARGS+=( --password "$ROOT_PW" )
   [ -n "${SSH_KEYS_FILE:-}" ] && PCT_ARGS+=( --ssh-public-keys "$SSH_KEYS_FILE" )
 
@@ -358,9 +359,10 @@ case "${PORT}" in
   ''|*[!0-9]*) echo "Invalid PORT=${PORT}" >&2; exit 1 ;;
 esac
 
+# ffmpeg provides ffprobe, needed by TorrServer in some scenarios.
 apk add --no-cache ca-certificates curl wget tzdata bash gcompat libc6-compat openssh ffmpeg
 
-# timezone
+# timezone (will work after tzdata installation)
 if [ -e "/usr/share/zoneinfo/${TZ}" ]; then
   cp "/usr/share/zoneinfo/${TZ}" /etc/localtime
   echo "${TZ}" > /etc/timezone
@@ -394,15 +396,15 @@ if [ "${ENABLE_SSH}" = "1" ]; then
   rc-service sshd restart || rc-service sshd start
 fi
 
-# /opt/ts volume + home
+# /opt/ts volume + HOME inside it
 mkdir -p /opt/ts/config /opt/ts/cache /opt/ts/log /opt/ts/home
 ln -snf /opt/ts/cache /opt/ts/torrents
 
 addgroup -S torrserver 2>/dev/null || true
 
-# Create user with home at /opt/ts/home (no-login)
-# NOTE: adduser flags differ across distros; in Alpine BusyBox adduser supports -h for home.
-adduser -S -D -H -h /opt/ts/home -s /sbin/nologin -G torrserver torrserver 2>/dev/null || true
+# Create/ensure user, home is /opt/ts/home
+# (BusyBox adduser in Alpine supports -h for home)
+adduser -S -D -h /opt/ts/home -s /sbin/nologin -G torrserver torrserver 2>/dev/null || true
 
 chown -R torrserver:torrserver /opt/ts || true
 
@@ -459,13 +461,15 @@ if [ -n "${TS_LOG_PATH:-}" ]; then
   ARGS+=( "--logpath" "${TS_LOG_PATH}" )
 fi
 
-echo "Starting TorrServer at $(date -Iseconds) with HOME=${HOME} args: ${ARGS[*]}" >&2
+echo "Starting TorrServer at $(date -Iseconds) HOME=${HOME} args: ${ARGS[*]}" >&2
 exec /usr/local/bin/torrserver "${ARGS[@]}"
 RUN
 chmod +x /usr/local/bin/torrserver-run
 
-# OpenRC service: use supervise-daemon with capabilities so bind(80) works in unprivileged LXC
-# supervise-daemon supports --capabilities cap-list. [page:0]
+# OpenRC service: use supervise-daemon with --capabilities in cap_iab(3) format.
+# Need inheritable + ambient for cap_net_bind_service:
+#   cap_net_bind_service  -> Inh
+#   ^cap_net_bind_service -> Amb (must be <= Inh)
 cat > /etc/init.d/torrserver <<'INIT'
 #!/sbin/openrc-run
 name="torrserver"
@@ -480,9 +484,8 @@ respawn_delay=5
 respawn_max=0
 respawn_period=0
 
-# CAP_NET_BIND_SERVICE allows binding to ports <1024 (like 80) without running as root.
-# Using supervise-daemon --capabilities is more reliable than filecap in some container setups.
-supervise_daemon_args="--capabilities cap_net_bind_service+eip"
+# cap_iab(3) syntax (IAB tuple): Inh + Amb.
+supervise_daemon_args="--capabilities cap_net_bind_service,^cap_net_bind_service"
 
 depend() { need net; }
 INIT
