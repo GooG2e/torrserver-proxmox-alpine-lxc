@@ -4,41 +4,36 @@ set -euo pipefail
 APP="TorrServer (Alpine LXC)"
 DEF_TAGS="alpine;community-script;torrent;streaming"
 
-# Defaults (Default mode uses these; Advanced mode uses as pre-filled values)
+# Defaults (Default mode uses these; Advanced mode allows override)
 DEF_HOSTNAME="torrserver"
 DEF_ROOTFS_SIZE="1"      # GiB
-DEF_DATA_SIZE="4"        # GiB (for /opt/ts)
+DEF_DATA_SIZE="4"        # GiB (mounted to /opt/ts)
 DEF_RAM="256"            # MiB
 DEF_CORES="1"
 DEF_BRIDGE="vmbr0"
 DEF_IPCONF="dhcp"        # or: 192.168.1.50/24,gw=192.168.1.1
 DEF_TZ="Europe/Moscow"
 DEF_PORT="8090"
+
 FALLBACK_TEMPLATE="alpine-3.22-default_20250617_amd64.tar.xz"
 
-# ---------- Pretty output ----------
-BOLD="\e[1m"; CLR="\e[0m"
-GN="\e[32m"; YW="\e[33m"; RD="\e[31m"; BL="\e[36m"
-
-msg()  { echo -e "${BL}==>${CLR} $*"; }
-ok()   { echo -e "${GN}✓${CLR} $*"; }
-warn() { echo -e "${YW}!${CLR} $*"; }
-die()  { echo -e "${RD}✗${CLR} $*" >&2; exit 1; }
+# ---------- logging (stderr only; never pollute stdout used for captures) ----------
+log()  { echo -e "==> $*" >&2; }
+ok()   { echo -e "[OK] $*" >&2; }
+warn() { echo -e "[!!] $*" >&2; }
+die()  { echo -e "[ERR] $*" >&2; exit 1; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 have_whiptail() { command -v whiptail >/dev/null 2>&1; }
 
-# ---------- UI helpers ----------
 ensure_whiptail() {
   if have_whiptail; then return 0; fi
-  warn "whiptail not found on host; trying to install for nicer UI..."
+  warn "whiptail not found on host; trying to install..."
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y >/dev/null 2>&1 || true
     apt-get install -y whiptail >/dev/null 2>&1 || true
   fi
-  if ! have_whiptail; then
-    warn "whiptail still missing; falling back to text prompts."
-  fi
+  have_whiptail || warn "whiptail still missing; using text prompts."
 }
 
 ask() {
@@ -58,40 +53,20 @@ menu() {
   local title="$1"; shift
   local prompt="$1"; shift
   local def="$1"; shift
-
   if have_whiptail; then
     whiptail --backtitle "Proxmox VE Helper-Scripts style" --title "$title" \
       --menu "$prompt" 18 86 12 --default-item "$def" "$@" 3>&1 1>&2 2>&3
   else
     local tags=()
     while [ $# -gt 0 ]; do tags+=("$1"); shift; shift || true; done
-    echo "Select: $prompt"
-    local i=1; for t in "${tags[@]}"; do echo "  $i) $t"; i=$((i+1)); done
+    echo "Select: $prompt" >&2
+    local i=1; for t in "${tags[@]}"; do echo "  $i) $t" >&2; i=$((i+1)); done
     local n; read -r -p "Choice [1-${#tags[@]}] (default: 1): " n
     n="${n:-1}"; echo "${tags[$((n-1))]}"
   fi
 }
 
-yesno() {
-  local title="$1" prompt="$2" default_yes="$3"
-  if have_whiptail; then
-    if [ "$default_yes" = "1" ]; then
-      whiptail --backtitle "Proxmox VE Helper-Scripts style" --title "$title" --yesno "$prompt" 9 78
-    else
-      whiptail --backtitle "Proxmox VE Helper-Scripts style" --title "$title" --yesno "$prompt" 9 78 --defaultno
-    fi
-    return $?
-  else
-    local ans defchar
-    defchar="$( [ "$default_yes" = "1" ] && echo y || echo n )"
-    read -r -p "$prompt (y/n) [$defchar]: " ans
-    ans="${ans:-$defchar}"
-    [[ "$ans" =~ ^[Yy]$ ]]
-  fi
-}
-
 password_prompt_optional() {
-  # Outputs password to stdout (may be empty)
   if have_whiptail; then
     local pw1 pw2
     while true; do
@@ -109,7 +84,7 @@ password_prompt_optional() {
     done
   else
     local pw
-    read -r -s -p "Root password (empty = skip): " pw; echo
+    read -r -s -p "Root password (empty = skip): " pw; echo >&2
     echo "$pw"
   fi
 }
@@ -124,44 +99,38 @@ pick_latest_alpine_template() {
     | tail -1
 }
 
-storages_for_content_rows() {
+storages_rows_for_content() {
   local content="$1"
-  # columns: name type status total used avail%
+  # Name Type Status Total Used Available %
   pvesm status -content "$content" 2>/dev/null | awk 'NR>1'
 }
 
 select_storage() {
-  # select_storage "TITLE" content label
+  # select_storage "TITLE" content label  -> echoes only storage ID (stdout)
   local title="$1" content="$2" label="$3"
 
-  mapfile -t rows < <(storages_for_content_rows "$content")
+  mapfile -t rows < <(storages_rows_for_content "$content")
   [ "${#rows[@]}" -gt 0 ] || die "No storage found with content '$content'"
 
-  # if only one active -> auto
-  local active_count=0
-  local last_active=""
+  local active=()
   for r in "${rows[@]}"; do
-    local st status
-    st="$(awk '{print $1}' <<<"$r")"
+    local name status
+    name="$(awk '{print $1}' <<<"$r")"
     status="$(awk '{print $3}' <<<"$r")"
-    if [ "$status" = "active" ]; then
-      active_count=$((active_count+1))
-      last_active="$st"
-    fi
+    [ "$status" = "active" ] && active+=("$name")
   done
-  [ "$active_count" -gt 0 ] || die "No ACTIVE storage found with content '$content'"
+  [ "${#active[@]}" -gt 0 ] || die "No ACTIVE storage found for content '$content'"
 
-  if [ "$active_count" -eq 1 ]; then
-    ok "Storage for ${label}: ${last_active} (only active option)"
-    echo "$last_active"
+  if [ "${#active[@]}" -eq 1 ]; then
+    ok "Storage for ${label}: ${active[0]} (only active option)"
+    echo "${active[0]}"
     return 0
   fi
 
-  # menu options: tag=storage, item=desc
-  command -v numfmt >/dev/null 2>&1 || warn "numfmt missing; sizes will be shown raw."
-
   local opts=()
-  local first=""
+  local first="${active[0]}"
+  command -v numfmt >/dev/null 2>&1 || warn "numfmt missing; showing raw sizes."
+
   for r in "${rows[@]}"; do
     local name type status total used availp
     name="$(awk '{print $1}' <<<"$r")"
@@ -171,7 +140,6 @@ select_storage() {
     used="$(awk '{print $5}' <<<"$r")"
     availp="$(awk '{print $6}' <<<"$r")"
     [ "$status" = "active" ] || continue
-    [ -z "$first" ] && first="$name"
 
     local free_k=$((total-used))
     local total_h used_h free_h
@@ -182,7 +150,6 @@ select_storage() {
     else
       total_h="${total}K"; used_h="${used}K"; free_h="${free_k}K"
     fi
-
     opts+=("$name" "type=$type free=$free_h used=$used_h total=$total_h ($availp)")
   done
 
@@ -190,7 +157,6 @@ select_storage() {
 }
 
 collect_host_ssh_keys() {
-  # Gather keys from common places on Proxmox node; dedup.
   {
     [ -f /root/.ssh/authorized_keys ] && cat /root/.ssh/authorized_keys
     cat /root/.ssh/*.pub 2>/dev/null || true
@@ -198,68 +164,67 @@ collect_host_ssh_keys() {
   } | awk 'NF>1 && $1 ~ /^ssh-|^ecdsa-|^sk-ssh-/ {print $0}' | awk '!seen[$0]++'
 }
 
-select_ssh_keys_optional() {
-  # Output selected keys (can be empty)
-  local existing manual picked
-  existing="$(collect_host_ssh_keys || true)"
-  manual=""
-  picked=""
-
-  if have_whiptail; then
-    manual=$(whiptail --backtitle "Proxmox VE Helper-Scripts style" \
-      --title "SSH KEYS (manual input)" \
-      --inputbox "Paste public key(s) (optional). Multiple lines allowed.\nLeave empty to skip." \
-      14 86 "" 3>&1 1>&2 2>&3) || exit 1
-  else
-    read -r -p "Paste SSH public key (optional, single line). Empty to skip: " manual
-  fi
-
-  if [ -n "$existing" ] && have_whiptail; then
-    local opts=()
-    local i=1
-    while IFS= read -r line; do
-      local comment
-      comment="$(awk '{print $NF}' <<<"$line")"
-      opts+=("$i" "$comment" "OFF")
-      i=$((i+1))
-    done <<<"$existing"
-
-    local sel=""
-    sel=$(whiptail --backtitle "Proxmox VE Helper-Scripts style" \
-      --title "SSH KEYS (from Proxmox)" \
-      --checklist "Select keys to add (SPACE to toggle)" \
-      20 86 12 "${opts[@]}" 3>&1 1>&2 2>&3) || true
-
-    if [ -n "$sel" ]; then
-      local idx
-      for idx in $sel; do
-        idx="${idx//\"/}"
-        picked+=$(echo "$existing" | sed -n "${idx}p")
-        picked+=$'\n'
-      done
-    fi
-  fi
-
-  printf "%s\n%s\n" "$picked" "$manual" \
-    | awk 'NF>1 && $1 ~ /^ssh-|^ecdsa-|^sk-ssh-/ {print $0}' \
-    | awk '!seen[$0]++'
+ssh_keys_prompt_choice() {
+  # outputs: mode (none|manual|proxmox)
+  menu "SSH KEYS" "How to add SSH keys?" "none" \
+    "none"   "Do not add SSH keys" \
+    "manual" "Paste SSH public key(s)" \
+    "pve"    "Select key(s) from Proxmox node"
 }
 
-print_summary() {
-  local CTID="$1" HOSTNAME="$2" OS="$3" TYPE="$4" DISK="$5" CORES="$6" RAM="$7" \
-        TPL_STORE="$8" ROOT_STORE="$9" DATA_STORE="${10}" TEMPLATE="${11}" PORT="${12}" TAGS="${13}"
+ssh_keys_manual() {
+  # outputs keys (may be empty)
+  if have_whiptail; then
+    whiptail --backtitle "Proxmox VE Helper-Scripts style" \
+      --title "SSH KEYS (manual)" \
+      --inputbox "Paste public key(s). Multiple lines allowed." \
+      16 86 "" 3>&1 1>&2 2>&3 || exit 1
+  else
+    local k
+    echo "Paste SSH public key(s), end with Ctrl-D:" >&2
+    k="$(cat || true)"
+    echo "$k"
+  fi
+}
 
-  echo -e "\n${BOLD}${APP}${CLR}"
-  echo -e "${GN}✓${CLR} Container ID: ${BOLD}${CTID}${CLR}"
-  echo -e "${GN}✓${CLR} Hostname: ${BOLD}${HOSTNAME}${CLR}"
-  echo -e "${GN}✓${CLR} OS: ${BOLD}${OS}${CLR}"
-  echo -e "${GN}✓${CLR} Type: ${BOLD}${TYPE}${CLR}"
-  echo -e "${GN}✓${CLR} RootFS: ${BOLD}${DISK}GiB${CLR}  Cores: ${BOLD}${CORES}${CLR}  RAM: ${BOLD}${RAM}MiB${CLR}"
-  echo -e "${GN}✓${CLR} Template: ${BOLD}${TEMPLATE}${CLR} (storage: ${TPL_STORE})"
-  echo -e "${GN}✓${CLR} RootFS storage: ${BOLD}${ROOT_STORE}${CLR}"
-  echo -e "${GN}✓${CLR} Data storage: ${BOLD}${DATA_STORE}${CLR} (mp0 -> /opt/ts)"
-  echo -e "${GN}✓${CLR} Port: ${BOLD}${PORT}${CLR}"
-  echo -e "${GN}✓${CLR} Tags: ${BOLD}${TAGS}${CLR}\n"
+ssh_keys_select_from_pve() {
+  # outputs keys (may be empty)
+  local existing
+  existing="$(collect_host_ssh_keys || true)"
+  [ -n "$existing" ] || { warn "No SSH keys found on Proxmox node."; echo ""; return 0; }
+
+  if ! have_whiptail; then
+    warn "whiptail missing; cannot checklist-select. Falling back to manual."
+    echo "$existing" | head -n 1
+    return 0
+  fi
+
+  local opts=()
+  local i=1
+  while IFS= read -r line; do
+    local comment
+    comment="$(awk '{print $NF}' <<<"$line")"
+    opts+=("$i" "$comment" "OFF")
+    i=$((i+1))
+  done <<<"$existing"
+
+  local sel=""
+  sel=$(whiptail --backtitle "Proxmox VE Helper-Scripts style" \
+    --title "SSH KEYS (from Proxmox)" \
+    --checklist "Select keys (SPACE to toggle)" \
+    20 86 12 "${opts[@]}" 3>&1 1>&2 2>&3) || true
+
+  [ -n "$sel" ] || { echo ""; return 0; }
+
+  local picked=""
+  local idx
+  for idx in $sel; do
+    idx="${idx//\"/}"
+    picked+=$(echo "$existing" | sed -n "${idx}p")
+    picked+=$'\n'
+  done
+
+  echo "$picked" | awk 'NF>1 && $1 ~ /^ssh-|^ecdsa-|^sk-ssh-/ {print $0}' | awk '!seen[$0]++'
 }
 
 main() {
@@ -285,8 +250,10 @@ main() {
     "default"  "Default Settings" \
     "advanced" "Advanced Settings")"
 
-  # select storages from existing
-  msg "Selecting storages..."
+  log "Auto Container ID: $CTID"
+
+  # storage selections (from existing)
+  log "Selecting storages (from configured Proxmox storages)..."
   local TEMPLATE_STORAGE ROOTFS_STORAGE DATA_STORAGE
   TEMPLATE_STORAGE="$(select_storage "TEMPLATE STORAGE" "vztmpl" "LXC templates (vztmpl)")"
   ROOTFS_STORAGE="$(select_storage "ROOTFS STORAGE" "rootdir" "container rootfs (rootdir)")"
@@ -294,8 +261,6 @@ main() {
 
   # parameters
   local HOSTNAME ROOTFS_SIZE DATA_SIZE RAM CORES BRIDGE IPCONF TZ PORT TAGS
-  local ENABLE_SSH="auto"   # auto|yes|no
-
   if [ "$MODE" = "advanced" ]; then
     HOSTNAME="$(ask "HOSTNAME" "Container hostname" "$DEF_HOSTNAME")"
     ROOTFS_SIZE="$(ask "ROOTFS SIZE" "RootFS size (GiB)" "$DEF_ROOTFS_SIZE")"
@@ -307,13 +272,6 @@ main() {
     TZ="$(ask "TIMEZONE" "Timezone" "$DEF_TZ")"
     PORT="$(ask "PORT" "TorrServer port" "$DEF_PORT")"
     TAGS="$(ask "TAGS" "Container tags (semicolon-separated)" "$DEF_TAGS")"
-
-    local ssh_mode
-    ssh_mode="$(menu "SSH" "Enable SSH server inside CT?" "auto" \
-      "auto" "Auto (enable if password or keys set)" \
-      "yes"  "Yes" \
-      "no"   "No")"
-    ENABLE_SSH="$ssh_mode"
   else
     HOSTNAME="$DEF_HOSTNAME"
     ROOTFS_SIZE="$DEF_ROOTFS_SIZE"
@@ -325,11 +283,33 @@ main() {
     TZ="$DEF_TZ"
     PORT="$DEF_PORT"
     TAGS="$DEF_TAGS"
-    ENABLE_SSH="auto"
   fi
 
-  # Alpine template selection
-  msg "Selecting Alpine template..."
+  # auth (password and/or ssh keys)
+  log "Authentication: you can set BOTH password and SSH keys."
+  local ROOT_PW SSH_KEYS SSH_KEYS_FILE=""
+  ROOT_PW="$(password_prompt_optional)"
+
+  local SSH_MODE
+  SSH_MODE="$(ssh_keys_prompt_choice)"
+  case "$SSH_MODE" in
+    none)   SSH_KEYS="";;
+    manual) SSH_KEYS="$(ssh_keys_manual)";;
+    pve)    SSH_KEYS="$(ssh_keys_select_from_pve)";;
+    *)      SSH_KEYS="";;
+  esac
+  SSH_KEYS="$(echo "${SSH_KEYS:-}" | awk 'NF>0')"
+
+  if [ -n "${SSH_KEYS:-}" ]; then
+    SSH_KEYS_FILE="$(mktemp)"
+    printf "%s\n" "$SSH_KEYS" >"$SSH_KEYS_FILE"
+    ok "SSH keys prepared: $(wc -l <"$SSH_KEYS_FILE")"
+  else
+    ok "SSH keys: none"
+  fi
+
+  # pick template
+  log "Selecting Alpine template..."
   pveam update >/dev/null 2>&1 || true
 
   local host_arch tpl_arch
@@ -345,37 +325,9 @@ main() {
   [ -n "${TEMPLATE:-}" ] || TEMPLATE="$FALLBACK_TEMPLATE"
 
   pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null 2>&1 || true
-  ok "Template ready: $TEMPLATE"
+  ok "Template ready: $TEMPLATE (storage: $TEMPLATE_STORAGE)"
 
-  # Auth
-  msg "Authentication (you can set BOTH password and SSH keys)"
-  local ROOT_PW SSH_KEYS SSH_KEYS_FILE=""
-  ROOT_PW="$(password_prompt_optional)"
-  SSH_KEYS="$(select_ssh_keys_optional || true)"
-  SSH_KEYS="$(echo "$SSH_KEYS" | awk 'NF>0')"
-
-  if [ -n "${SSH_KEYS:-}" ]; then
-    SSH_KEYS_FILE="$(mktemp)"
-    printf "%s\n" "$SSH_KEYS" >"$SSH_KEYS_FILE"
-    ok "SSH keys selected: $(wc -l <"$SSH_KEYS_FILE")"
-  else
-    ok "SSH keys: none"
-  fi
-
-  # Summary
-  print_summary "$CTID" "$HOSTNAME" "alpine" "unprivileged" "$ROOTFS_SIZE" "$CORES" "$RAM" \
-    "$TEMPLATE_STORAGE" "$ROOTFS_STORAGE" "$DATA_STORAGE" "$TEMPLATE" "$PORT" "$TAGS"
-
-  if have_whiptail; then
-    yesno "CONFIRM" "Proceed with container creation?" 1 || die "Cancelled."
-  else
-    read -r -p "Proceed? (y/n) [y]: " yn
-    yn="${yn:-y}"
-    [[ "$yn" =~ ^[Yy]$ ]] || die "Cancelled."
-  fi
-
-  # Build pct create args
-  msg "Creating LXC..."
+  log "Creating LXC..."
   local -a PCT_ARGS
   PCT_ARGS=(
     create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}"
@@ -392,49 +344,35 @@ main() {
     --start 1
   )
 
-  # root password (optional)
-  if [ -n "${ROOT_PW:-}" ]; then
-    PCT_ARGS+=( --password "$ROOT_PW" )
-  fi
-
-  # ssh keys (optional)
-  if [ -n "${SSH_KEYS_FILE:-}" ]; then
-    PCT_ARGS+=( --ssh-public-keys "$SSH_KEYS_FILE" )
-  fi
+  # optional password + optional ssh keys (can be both) [page:6]
+  [ -n "${ROOT_PW:-}" ] && PCT_ARGS+=( --password "$ROOT_PW" )
+  [ -n "${SSH_KEYS_FILE:-}" ] && PCT_ARGS+=( --ssh-public-keys "$SSH_KEYS_FILE" )
 
   pct "${PCT_ARGS[@]}"
   ok "LXC created and started"
 
-  # Provision inside CT
-  msg "Provisioning inside container..."
+  log "Provisioning inside container..."
   cat > /tmp/provision-torrserver-alpine.sh <<'EOF'
 #!/bin/sh
 set -eu
 
 : "${TZ:=Europe/Moscow}"
 : "${PORT:=8090}"
-: "${ENABLE_SSH:=auto}"   # auto|yes|no
-: "${ROOT_PW_SET:=0}"     # 1/0
-: "${SSH_KEYS_SET:=0}"    # 1/0
 
 apk add --no-cache ca-certificates curl wget tzdata bash gcompat libc6-compat
 
-# timezone
 if [ -e "/usr/share/zoneinfo/${TZ}" ]; then
   cp "/usr/share/zoneinfo/${TZ}" /etc/localtime
   echo "${TZ}" > /etc/timezone
 fi
 
-# Data layout: one volume /opt/ts
 mkdir -p /opt/ts/config /opt/ts/cache /opt/ts/log
 ln -snf /opt/ts/cache /opt/ts/torrents
 
-# service user + permissions (fix restart loops due to /opt/ts root:root)
 addgroup -S torrserver 2>/dev/null || true
 adduser  -S -D -H -s /sbin/nologin -G torrserver torrserver 2>/dev/null || true
 chown -R torrserver:torrserver /opt/ts
 
-# download TorrServer
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64)  TSARCH="amd64" ;;
@@ -450,7 +388,6 @@ URL="https://github.com/YouROK/TorrServer/releases/latest/download/TorrServer-li
 curl -L -o "${BIN}" "${URL}"
 chmod +x "${BIN}"
 
-# env config (compose-like)
 cat > /etc/conf.d/torrserver <<CONF
 TZ=${TZ}
 TS_PORT=${PORT}
@@ -458,8 +395,6 @@ TS_DONTKILL=1
 TS_CONF_PATH=/opt/ts/config
 TS_TORR_DIR=/opt/ts/cache
 TS_LOG_PATH=/opt/ts/log/torrserver.log
-# TS_HTTPAUTH=1
-# TS_RDB=1
 CONF
 
 cat > /usr/local/bin/torrserver-run <<'RUN'
@@ -486,7 +421,6 @@ exec /usr/local/bin/torrserver "${ARGS[@]}"
 RUN
 chmod +x /usr/local/bin/torrserver-run
 
-# OpenRC service
 cat > /etc/init.d/torrserver <<'INIT'
 #!/sbin/openrc-run
 name="torrserver"
@@ -507,63 +441,20 @@ chmod +x /etc/init.d/torrserver
 
 rc-update add torrserver default
 rc-service torrserver restart || rc-service torrserver start
-
-# Decide whether to enable SSH
-enable_ssh=0
-case "${ENABLE_SSH}" in
-  yes) enable_ssh=1 ;;
-  no) enable_ssh=0 ;;
-  auto)
-    if [ "${ROOT_PW_SET}" = "1" ] || [ "${SSH_KEYS_SET}" = "1" ]; then
-      enable_ssh=1
-    fi
-    ;;
-esac
-
-if [ "$enable_ssh" = "1" ]; then
-  apk add --no-cache openssh
-  ssh-keygen -A
-
-  # root login policy:
-  # - if password set -> PermitRootLogin yes
-  # - else -> keys only
-  if [ "${ROOT_PW_SET}" = "1" ]; then
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-    grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
-  else
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || true
-    grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
-  fi
-
-  rc-update add sshd default
-  rc-service sshd restart || rc-service sshd start
-fi
 EOF
 
   chmod +x /tmp/provision-torrserver-alpine.sh
   pct push "$CTID" /tmp/provision-torrserver-alpine.sh /root/provision-torrserver.sh
-
-  local ROOT_PW_SET=0 SSH_KEYS_SET=0
-  [ -n "${ROOT_PW:-}" ] && ROOT_PW_SET=1
-  [ -n "${SSH_KEYS_FILE:-}" ] && SSH_KEYS_SET=1
-
-  pct exec "$CTID" -- env \
-    TZ="$TZ" PORT="$PORT" \
-    ENABLE_SSH="$ENABLE_SSH" \
-    ROOT_PW_SET="$ROOT_PW_SET" SSH_KEYS_SET="$SSH_KEYS_SET" \
-    sh /root/provision-torrserver.sh
-
+  pct exec "$CTID" -- env TZ="$TZ" PORT="$PORT" sh /root/provision-torrserver.sh
   ok "Provision complete"
 
-  # cleanup
   [ -n "${SSH_KEYS_FILE:-}" ] && rm -f "$SSH_KEYS_FILE" || true
 
-  echo
+  echo >&2
   ok "Created CTID: $CTID"
   ok "Tags: $TAGS"
   ok "TorrServer: http://<CT_IP>:${PORT}"
-  ok "Check service: pct exec ${CTID} -- rc-service torrserver status"
-  ok "Check port: pct exec ${CTID} -- sh -lc 'apk add --no-cache iproute2-ss >/dev/null 2>&1 || true; ss -lntp | grep :${PORT} || true'"
+  ok "Service check: pct exec ${CTID} -- rc-service torrserver status"
 }
 
 main "$@"
